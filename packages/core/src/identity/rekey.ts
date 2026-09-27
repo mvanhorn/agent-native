@@ -36,7 +36,6 @@ export type IdentityColumn = {
     | "unsupported-oauth";
 };
 
-/** Mutable identity references only. Historical actor/creator fields are intentionally retained. */
 export const IDENTITY_REKEY_COLUMNS: readonly IdentityColumn[] = [
   { table: "user", column: "email" },
   { table: "invitation", column: "email" },
@@ -62,7 +61,17 @@ export const IDENTITY_REKEY_COLUMNS: readonly IdentityColumn[] = [
     column: "user_id",
     mode: "email-user-id",
   },
+  {
+    table: "agent_instruction_updates",
+    column: "user_id",
+    mode: "email-user-id",
+  },
   { table: "agent_evals", column: "user_id", mode: "email-user-id" },
+  {
+    table: "agent_eval_datasets",
+    column: "user_id",
+    mode: "email-user-id",
+  },
   {
     table: "agent_experiment_assignments",
     column: "user_id",
@@ -136,6 +145,7 @@ export const IDENTITY_REKEY_COLUMNS: readonly IdentityColumn[] = [
   { table: "resources", column: "owner", mode: "owner" },
   { table: "agent_review_comments", column: "author_email" },
   { table: "agent_review_comments", column: "owner_email" },
+  { table: "agent_review_notification_deliveries", column: "recipient_email" },
   { table: "agent_review_statuses", column: "updated_by" },
   { table: "agent_review_statuses", column: "owner_email" },
   { table: "agent_review_comment_reactions", column: "actor_email" },
@@ -161,7 +171,6 @@ const OPTIONAL_TABLES = new Set(
   IDENTITY_REKEY_COLUMNS.map(({ table }) => table),
 );
 
-/** Columns that are deliberately stable IDs or immutable provenance, not email identities. */
 export const IDENTITY_REKEY_IGNORED_COLUMNS = new Set([
   "agent_audit_log.actor_email",
   "agent_audit_log.owner_email",
@@ -169,6 +178,7 @@ export const IDENTITY_REKEY_IGNORED_COLUMNS = new Set([
   "tool_history.owner_email",
   "agent_resource_versions.created_by",
   "agent_review_comments.created_by",
+  "agent_human_review_summaries.created_by",
   "organizations.created_by",
   "member.user_id",
   "account.user_id",
@@ -297,7 +307,6 @@ function predicate(
 export interface IdentityRekeyResult {
   counts: Record<string, number>;
   sessionCount: number;
-  /** OAuth rows that were revoked because their payload could not be safely rewritten. */
   oauthRevokedCount: number;
 }
 
@@ -330,7 +339,6 @@ export async function listPendingIdentityRekeys(
   }));
 }
 
-/** The ledger is intentionally separate from the Better Auth update transaction. */
 export async function ensureIdentityRekeyLedger(
   db: IdentityRekeyDb,
 ): Promise<void> {
@@ -444,7 +452,6 @@ export async function failIdentityRekey(
   );
 }
 
-/** Durable wrapper used by Better Auth hooks and the CLI. */
 export async function executeIdentityRekey(
   db: IdentityRekeyDb,
   oldEmail: string,
@@ -468,7 +475,6 @@ export async function executeIdentityRekey(
   }
 }
 
-/** Retry rows left pending after Better Auth committed the account email. */
 export async function resumePendingIdentityRekeys(
   db: IdentityRekeyDb,
   email: string,
@@ -568,6 +574,91 @@ export async function rekeyIdentityAfterEmailVerification(
     actorEmail: args.actorEmail ?? args.verifiedEmail,
     caller: "email-verification",
   });
+}
+
+/**
+ * Promotion keys embed the owner email (`from-trace:<encoded-email>:<run>`).
+ * Rewriting only `user_id` would hide the row from the new email and insert
+ * a duplicate on the next promote.
+ */
+function rekeyedPromotedDatasetIdempotencyKey(
+  current: string | null,
+  newEmail: string,
+): string | null {
+  if (current == null) return null;
+  const prefix = "from-trace:";
+  if (!current.startsWith(prefix)) return current;
+  const rest = current.slice(prefix.length);
+  const separator = rest.indexOf(":");
+  if (separator < 0) return current;
+  return `${prefix}${encodeURIComponent(newEmail)}:${rest.slice(separator + 1)}`;
+}
+
+async function rekeyPromotedEvalDatasetKeys(
+  db: IdentityRekeyDb,
+  oldEmail: string,
+  newEmail: string,
+  dryRun: boolean | undefined,
+): Promise<void> {
+  const datasetRows = await db.unsafe(
+    `SELECT id, idempotency_key FROM agent_eval_datasets WHERE LOWER(user_id) = LOWER($1) FOR UPDATE`,
+    [oldEmail],
+  );
+  const updates = datasetRows.map((row) => {
+    const currentKey =
+      typeof row.idempotency_key === "string" ? row.idempotency_key : null;
+    return {
+      id: row.id,
+      previousKey: currentKey,
+      nextKey: rekeyedPromotedDatasetIdempotencyKey(currentKey, newEmail),
+    };
+  });
+  const seen = new Set<string>();
+  for (const update of updates) {
+    if (update.nextKey == null) continue;
+    if (seen.has(update.nextKey)) {
+      throw new Error(
+        "Promoted eval dataset collision detected; no identity data was changed.",
+      );
+    }
+    seen.add(update.nextKey);
+  }
+  const nextKeys = [...seen];
+  if (nextKeys.length > 0 && updates.length > 0) {
+    const keyPlaceholders = nextKeys
+      .map((_, index) => `$${index + 1}`)
+      .join(", ");
+    const idPlaceholders = updates
+      .map((_, index) => `$${nextKeys.length + 1 + index}`)
+      .join(", ");
+    const collisionRows = await db.unsafe(
+      `SELECT 1 FROM agent_eval_datasets
+       WHERE idempotency_key IN (${keyPlaceholders})
+         AND id NOT IN (${idPlaceholders})
+       LIMIT 1`,
+      [...nextKeys, ...updates.map((update) => update.id)],
+    );
+    if (collisionRows.length) {
+      throw new Error(
+        "Promoted eval dataset collision detected; no identity data was changed.",
+      );
+    }
+  }
+  if (dryRun) return;
+  for (const update of updates) {
+    if (update.previousKey != null && update.previousKey !== update.nextKey) {
+      await db.unsafe(
+        `UPDATE agent_eval_datasets SET idempotency_key = NULL WHERE id = $1 AND idempotency_key = $2`,
+        [update.id, update.previousKey],
+      );
+    }
+  }
+  for (const update of updates) {
+    await db.unsafe(
+      `UPDATE agent_eval_datasets SET user_id = $1, idempotency_key = $2 WHERE id = $3`,
+      [newEmail, update.nextKey, update.id],
+    );
+  }
 }
 
 /** Run inside the caller's PostgreSQL transaction. It deliberately refuses credential and derived-key stores it cannot safely rewrite. */
@@ -885,6 +976,18 @@ export async function rekeyIdentity(
           throw new Error(
             "Experiment assignment collision detected; no identity data was changed.",
           );
+      }
+      if (
+        entry.table === "agent_eval_datasets" &&
+        available.has("idempotency_key")
+      ) {
+        await rekeyPromotedEvalDatasetKeys(
+          db,
+          oldEmail,
+          newEmail,
+          options.dryRun,
+        );
+        continue;
       }
       if (!options.dryRun)
         await db.unsafe(
