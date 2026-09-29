@@ -35,11 +35,14 @@ export function LibraryPrimaryActions({
       <ImportMenu
         uploadHref={uploadHref}
         importLoomHref={importLoomHref}
+        spaceId={spaceId}
+        folderId={folderId}
+        recordHref={recordHref}
         iconOnly
         triggerIcon="chevron"
         size="sm"
         variant="default"
-        className="w-8 self-stretch border-s border-primary-foreground/20 px-0 shadow-none"
+        className="w-8 self-stretch rounded-e-md border-s border-primary-foreground/20 px-0 shadow-none"
         menuSide="bottom"
         menuAlign="end"
       />
